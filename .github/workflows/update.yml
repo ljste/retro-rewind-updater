@@ -1,0 +1,154 @@
+name: Update Retro Rewind
+
+on:
+  schedule:
+    - cron: '17 */6 * * *'
+  workflow_dispatch:
+    inputs:
+      force:
+        description: Rebuild the current pack to verify the complete pipeline
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: retro-rewind-production
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    outputs:
+      build: ${{ steps.pack.outputs.build }}
+      latest: ${{ steps.pack.outputs.latest }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: ljste/retro-rewind-web
+          ref: main
+          path: source
+          ssh-key: ${{ secrets.SOURCE_READ_KEY }}
+          persist-credentials: false
+      - id: pack
+        working-directory: source
+        env:
+          FORCE: ${{ inputs.force || false }}
+        run: |
+          flags=()
+          if [[ "$FORCE" == true ]]; then flags+=(--force); fi
+          python3 -m web.ci_check "${flags[@]}"
+      - name: Record check result
+        env:
+          LATEST: ${{ steps.pack.outputs.latest }}
+          CURRENT: ${{ steps.pack.outputs.current }}
+          BUILD: ${{ steps.pack.outputs.build }}
+        run: |
+          printf 'Official pack: %s\n\nPublished pack: %s\n\nBuild required: %s\n' "$LATEST" "$CURRENT" "$BUILD" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Record monthly health check
+        env:
+          LATEST: ${{ steps.pack.outputs.latest }}
+        run: |
+          python3 - <<'PYTHON'
+          import datetime
+          import json
+          import os
+          from pathlib import Path
+          state = {"month": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m"), "officialPack": os.environ["LATEST"]}
+          Path("status.json").write_text(json.dumps(state, indent=2) + "\n")
+          PYTHON
+          if ! git diff --quiet -- status.json || [[ ! -f status.json ]]; then
+            git config user.name 'github-actions[bot]'
+            git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+            git add status.json
+            git commit -m 'Record updater health check'
+            git push
+          fi
+
+  publish:
+    needs: check
+    if: needs.check.outputs.build == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    env:
+      JOBS: '4'
+      BINARYEN_CORES: '4'
+      PACKAGE_LINK_ASSETS: '1'
+      BUILD_COMPATIBILITY: '1'
+      WEB_CONTINUATIONS: jspi
+      EMSDK_QUIET: '1'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: ljste/retro-rewind-web
+          ref: main
+          ssh-key: ${{ secrets.SOURCE_READ_KEY }}
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: '24'
+      - uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9
+        with:
+          dotnet-version: '8.0.x'
+      - name: Install build tools
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/swift /opt/hostedtoolcache/CodeQL
+          df -h .
+          sudo apt-get update -qq
+          sudo apt-get install -y ninja-build rsync
+          npm ci --no-audit --no-fund
+      - name: Restore verified game inputs
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
+        id: inputs
+        with:
+          path: |
+            Assets
+            PulsarPacks/completed/RetroRewind/RetroRewind6
+          key: retro-inputs-${{ hashFiles('web/ci-base.json') }}
+      - run: python3 web/bootstrap_build.py
+      - name: Cache baseline inputs before applying updates
+        if: steps.inputs.outputs.cache-hit != 'true'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          path: |
+            Assets
+            PulsarPacks/completed/RetroRewind/RetroRewind6
+          key: retro-inputs-${{ hashFiles('web/ci-base.json') }}
+      - name: Install pinned Emscripten
+        run: |
+          git clone --depth 1 https://github.com/emscripten-core/emsdk.git "$RUNNER_TEMP/emsdk"
+          "$RUNNER_TEMP/emsdk/emsdk" install 6.0.12
+          "$RUNNER_TEMP/emsdk/emsdk" activate 6.0.12
+      - name: Build both engines for the official pack
+        run: |
+          source "$RUNNER_TEMP/emsdk/emsdk_env.sh"
+          npm run build -- --translate
+      - name: Verify updater and browser contracts
+        run: |
+          python3 -m unittest web.tests.test_pack_updates web.tests.test_ci_build
+          node --experimental-vm-modules --test web/tests/test_asset_install.mjs web/tests/test_controls_resume.mjs web/tests/test_frame_pacing.mjs web/tests/test_cloudflare_hosting.mjs
+          node_modules/.bin/tsc -p web/tsconfig.json
+      - name: Stage immutable assets and publish Cloudflare
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          RETRO_MIRROR_SSH_HOST: rrpublish@129.80.89.43
+          RETRO_MIRROR_SSH_KEY: ${{ runner.temp }}/retro-publish-key
+          RETRO_MIRROR_SUDO: '0'
+          MIRROR_SSH_KEY: ${{ secrets.MIRROR_SSH_KEY }}
+          MIRROR_KNOWN_HOSTS: ${{ secrets.MIRROR_KNOWN_HOSTS }}
+        run: |
+          test -n "$CLOUDFLARE_API_TOKEN"
+          test -n "$MIRROR_SSH_KEY"
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "$MIRROR_SSH_KEY" > "$RETRO_MIRROR_SSH_KEY"
+          chmod 600 "$RETRO_MIRROR_SSH_KEY"
+          printf '%s\n' "$MIRROR_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          trap 'rm -f "$RETRO_MIRROR_SSH_KEY"' EXIT
+          python3 web/publish_pack.py
+          cat build/pack-updates/published.json >> "$GITHUB_STEP_SUMMARY"
