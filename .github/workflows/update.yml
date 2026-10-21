@@ -101,7 +101,7 @@ jobs:
           sudo rm -rf /usr/local/lib/android /usr/share/swift /opt/hostedtoolcache/CodeQL
           df -h .
           sudo apt-get update -qq
-          sudo apt-get install -y ninja-build rsync
+          sudo apt-get install -y ninja-build rsync python3-venv
           npm ci --no-audit --no-fund
           python3 -m venv "$RUNNER_TEMP/python-tools"
           "$RUNNER_TEMP/python-tools/bin/pip" install -r web/requirements.txt
