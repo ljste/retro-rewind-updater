@@ -103,6 +103,9 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y ninja-build rsync
           npm ci --no-audit --no-fund
+          python3 -m venv "$RUNNER_TEMP/python-tools"
+          "$RUNNER_TEMP/python-tools/bin/pip" install -r web/requirements.txt
+          printf '%s\n' "$RUNNER_TEMP/python-tools/bin" >> "$GITHUB_PATH"
       - name: Restore verified game inputs
         uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
         id: inputs
@@ -129,12 +132,7 @@ jobs:
         run: |
           source "$RUNNER_TEMP/emsdk/emsdk_env.sh"
           npm run build -- --translate
-      - name: Verify updater and browser contracts
-        run: |
-          python3 -m unittest web.tests.test_pack_updates web.tests.test_ci_build
-          node --experimental-vm-modules --test web/tests/test_asset_install.mjs web/tests/test_controls_resume.mjs web/tests/test_frame_pacing.mjs web/tests/test_cloudflare_hosting.mjs
-          node_modules/.bin/tsc -p web/tsconfig.json
-      - name: Stage immutable assets and publish Cloudflare
+      - name: Verify release, stage assets, and publish Cloudflare
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           RETRO_MIRROR_SSH_HOST: rrpublish@129.80.89.43
